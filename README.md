@@ -2,10 +2,6 @@
 
 ## Operational NCMRWF NWP Forecast Bust Prediction & Uncertainty Mapping System
 
-**Problem Statement ID:** 26079
-
-MoES BUST-DETECT is an AI/ML system for identifying regions and forecast lead times, from Day 1 through Day 10, where Numerical Weather Prediction (NWP) forecasts are likely to experience large errors, or forecast busts. It combines spatial atmospheric dynamics, tabular meteorological features, model stacking, and explainable AI into an operational FastAPI service with an interactive React map dashboard.
-
 ## Project Overview
 
 The system produces a continuous bust-risk probability for Indian land grid points and supports click-to-explain analysis for individual locations.
