@@ -1,0 +1,22 @@
+# Local command wrappers
+powershell.bat
+**/powershell.bat
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Frontend dependencies and build output
+frontend/node_modules/
+frontend/dist/
+
+# Tooling and OS files
+.pytest_cache/
+.mypy_cache/
+.DS_Store
+Thumbs.db

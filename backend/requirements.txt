@@ -1,0 +1,17 @@
+fastapi
+uvicorn
+numpy
+pydantic
+reverse_geocoder
+httpx
+pandas
+scipy
+shapely
+shap
+lime
+torch
+lightgbm
+catboost
+xarray
+netcdf4
+
