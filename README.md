@@ -8,13 +8,13 @@ The system produces a continuous bust-risk probability for Indian land grid poin
 
 ## Key Capabilities & Deliverables
 
-| System Capability | Implementation in VortexXAI | Status |
+| System Capability | Implementation in VortexXAI | 
 | :--- | :--- | :--- |
-| **Forecast Confidence Map** | 3D MapLibre/deck.gl grid visualization showing regional confidence/risk scores across India. | Verified |
-| **Forecast Bust Probability** | Stacking ensemble calculates continuous probability percentages (0%–100%) for forecast failure. | Verified |
-| **Error-Prone Area Detection** | Automated ranking of top high-risk failure zones (e.g., Western Ghats, Gangetic Plains). | Verified |
-| **Explainable Output (XAI)** | Real-time SHAP feature impact analysis and LIME local surrogate weights for key drivers. | Verified |
-| **Prototype Dashboard & API** | Full FastAPI backend with POST endpoints paired with a React + Vite operational interface. | Verified |
+| **Forecast Confidence Map** | 3D MapLibre/deck.gl grid visualization showing regional confidence/risk scores across India. | 
+| **Forecast Bust Probability** | Stacking ensemble calculates continuous probability percentages (0%–100%) for forecast failure. |
+| **Error-Prone Area Detection** | Automated ranking of top high-risk failure zones (e.g., Western Ghats, Gangetic Plains). | 
+| **Explainable Output (XAI)** | Real-time SHAP feature impact analysis and LIME local surrogate weights for key drivers. | 
+| **Prototype Dashboard & API** | Full FastAPI backend with POST endpoints paired with a React + Vite operational interface. | 
 
 ### Machine-learning pipeline
 
