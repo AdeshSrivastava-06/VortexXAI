@@ -1,6 +1,9 @@
 import os
 import math
+import time
+import datetime
 import json
+import httpx
 import numpy as np
 import reverse_geocoder as rg
 from fastapi import FastAPI
@@ -76,6 +79,11 @@ class ExplainRequest(BaseModel):
     lat: float
     lon: float
     lead_day: int
+
+
+class Forecast10DayRequest(BaseModel):
+    lat: float
+    lon: float
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -465,7 +473,9 @@ class EnsembleModel:
         lgb_path = os.path.join(root_dir, "lightgbm_bust_model.txt")
         if os.path.exists(lgb_path):
             try:
-                self.lgb_booster = lgb.Booster(model_file=lgb_path)
+                with open(lgb_path, "rb") as f:
+                    model_str = f.read().decode("utf-8").replace("\r\n", "\n")
+                self.lgb_booster = lgb.Booster(model_str=model_str)
                 print("Loaded LightGBM Booster from lightgbm_bust_model.txt")
             except Exception as e:
                 print(f"Failed to load LightGBM Booster: {e}")
@@ -595,7 +605,7 @@ class EnsembleModel:
 
 
 
-    def predict_batch(self, weather_items: list[tuple], lead_day: int) -> list[tuple]:
+    def predict_batch(self, weather_items: list[tuple], lead_day: int | list[int] = 1) -> list[tuple]:
         """Vectorized batch inference across PyTorch ConvLSTM, LightGBM, CatBoost, and Meta-Learner."""
         N = len(weather_items)
         if N == 0:
@@ -608,6 +618,11 @@ class EnsembleModel:
         hums = np.array([item[4] for item in weather_items], dtype=np.float32)
         winds = np.array([item[5] for item in weather_items], dtype=np.float32)
         press = np.array([item[6] for item in weather_items], dtype=np.float32)
+
+        if isinstance(lead_day, (list, tuple, np.ndarray)):
+            lead_arr = np.array(lead_day, dtype=np.float32)
+        else:
+            lead_arr = np.full(N, float(lead_day), dtype=np.float32)
 
         temp_anoms = np.abs(temps - 25.0)
         rain2s = rains ** 2
@@ -631,7 +646,7 @@ class EnsembleModel:
 
         # 4. PyTorch ConvLSTM batch spatial tensor prediction
         if self.convlstm_model is not None:
-            spatial_crops = [self.extract_spatial_crop(float(lats[i]), float(lons[i]), lead_day)[0] for i in range(N)]
+            spatial_crops = [self.extract_spatial_crop(float(lats[i]), float(lons[i]), int(lead_arr[i]))[0] for i in range(N)]
             X_spatial = np.stack(spatial_crops, axis=0)  # (N, Time, 4, H, W)
             with torch.no_grad():
                 tensor_input = torch.from_numpy(X_spatial).float()
@@ -649,7 +664,7 @@ class EnsembleModel:
             probs = 0.4 * convlstm_preds + 0.3 * lgb_preds + 0.3 * cat_preds
 
         boosts = np.array([spatial_risk_boost(float(lat), float(lon)) for lat, lon in zip(lats, lons)], dtype=np.float32)
-        probs = np.where(probs > 0.18, probs + boosts * 0.05 + lead_day * 0.01, probs + boosts * 0.01)
+        probs = np.where(probs > 0.18, probs + boosts * 0.05 + lead_arr * 0.01, probs + boosts * 0.01)
         probs = np.clip(probs, 0.01, 0.99)
 
 
@@ -699,34 +714,39 @@ ensemble = EnsembleModel()
 
 BACKGROUND_DATA: np.ndarray | None = None
 LIME_EXPLAINER = None
+SHAP_TREE_EXPLAINER = None
 
 
 def _get_ensemble_predict_proba(lat: float, lon: float, lead_day: int):
     """Vectorized ensemble prediction closure for LIME & SHAP surrogate modeling."""
+    x_spatial = ensemble.extract_spatial_crop(lat, lon, lead_day)
+    if ensemble.convlstm_model is not None:
+        with torch.no_grad():
+            conv_pred_base = float(ensemble.convlstm_model(torch.from_numpy(x_spatial).float()).item())
+    else:
+        conv_pred_base = 0.5
+
+    w1 = ensemble.meta_coefs[0][0] if ensemble.meta_coefs is not None else 7.33
+    w2 = ensemble.meta_coefs[0][1] if ensemble.meta_coefs is not None else 0.43
+    w3 = ensemble.meta_coefs[0][2] if ensemble.meta_coefs is not None else 0.41
+    b = ensemble.meta_intercept[0] if ensemble.meta_intercept is not None else -3.85
+
     def predict_proba_fn(X: np.ndarray) -> np.ndarray:
-        X = np.atleast_2d(X)
-        N = X.shape[0]
-        probs = np.empty(N, dtype=float)
+        X_float = np.atleast_2d(X).astype(np.float32)
+        N = X_float.shape[0]
 
-        x_spatial = ensemble.extract_spatial_crop(lat, lon, lead_day)
-        if ensemble.convlstm_model is not None:
-            with torch.no_grad():
-                conv_pred_base = float(ensemble.convlstm_model(torch.from_numpy(x_spatial).float()).item())
+        if ensemble.lgb_booster is not None:
+            lgb_preds = ensemble.lgb_booster.predict(X_float)
         else:
-            conv_pred_base = 0.5
+            lgb_preds = np.full(N, 0.5, dtype=np.float32)
 
-        w1 = ensemble.meta_coefs[0][0] if ensemble.meta_coefs is not None else 7.33
-        w2 = ensemble.meta_coefs[0][1] if ensemble.meta_coefs is not None else 0.43
-        w3 = ensemble.meta_coefs[0][2] if ensemble.meta_coefs is not None else 0.41
-        b = ensemble.meta_intercept[0] if ensemble.meta_intercept is not None else -3.85
+        if ensemble.cat_model is not None:
+            cat_preds = ensemble.cat_model.predict_proba(X_float)[:, 1]
+        else:
+            cat_preds = np.full(N, 0.5, dtype=np.float32)
 
-        for i in range(N):
-            x_row = X[i:i+1].astype(np.float32)
-            lgb_p = float(ensemble.lgb_booster.predict(x_row)[0]) if ensemble.lgb_booster is not None else 0.5
-            cat_p = float(ensemble.cat_model.predict_proba(x_row)[0][1]) if ensemble.cat_model is not None else 0.5
-            z = w1 * conv_pred_base + w2 * lgb_p + w3 * cat_p + b
-            probs[i] = 1.0 / (1.0 + math.exp(-z))
-
+        z = w1 * conv_pred_base + w2 * lgb_preds + w3 * cat_preds + b
+        probs = 1.0 / (1.0 + np.exp(-z))
         return np.column_stack([1.0 - probs, probs])
 
     return predict_proba_fn
@@ -768,13 +788,26 @@ def _exact_kernel_shap_numpy(predict_fn, x: np.ndarray, background: np.ndarray) 
 
 
 def compute_shap_values(feature_vector: np.ndarray, lat: float, lon: float, lead_day: int) -> list[dict]:
-    """Compute dynamic SHAP values directly from loaded LightGBM Booster instance or ensemble."""
+    """Compute dynamic SHAP values directly from pre-cached TreeExplainer instance or ensemble."""
     fvec_2d = feature_vector.reshape(1, -1).astype(np.float32)
 
-    if shap is not None and ensemble.lgb_booster is not None:
+    global SHAP_TREE_EXPLAINER
+    if SHAP_TREE_EXPLAINER is not None:
         try:
-            explainer = shap.TreeExplainer(ensemble.lgb_booster)
-            sv = explainer.shap_values(fvec_2d)
+            sv = SHAP_TREE_EXPLAINER.shap_values(fvec_2d)
+            if isinstance(sv, list):
+                vals = sv[0].flatten() if len(sv[0].shape) > 1 else sv[0]
+            else:
+                vals = sv.flatten()
+            res = [{"feature": FEATURE_NAMES[i], "value": round(float(vals[i]), 5)} for i in range(len(FEATURE_NAMES))]
+            res.sort(key=lambda x: abs(x["value"]), reverse=True)
+            return res
+        except Exception as e:
+            print(f"SHAP calculation fallback: {e}")
+    elif shap is not None and ensemble.lgb_booster is not None:
+        try:
+            SHAP_TREE_EXPLAINER = shap.TreeExplainer(ensemble.lgb_booster)
+            sv = SHAP_TREE_EXPLAINER.shap_values(fvec_2d)
             if isinstance(sv, list):
                 vals = sv[0].flatten() if len(sv[0].shape) > 1 else sv[0]
             else:
@@ -795,7 +828,7 @@ def compute_shap_values(feature_vector: np.ndarray, lat: float, lon: float, lead
     return res
 
 
-def _local_lime_surrogate_numpy(predict_fn, x: np.ndarray, num_samples: int = 400) -> np.ndarray:
+def _local_lime_surrogate_numpy(predict_fn, x: np.ndarray, num_samples: int = 150) -> np.ndarray:
     scale = (FEATURE_MAXS - FEATURE_MINS) + 1e-9
     noise = np.random.normal(0.0, 0.12, size=(num_samples, 5)) * scale
     Z = np.clip(x + noise, FEATURE_MINS, FEATURE_MAXS)
@@ -833,7 +866,7 @@ def compute_lime_weights(feature_vector: np.ndarray, lat: float, lon: float, lea
                 feature_vector,
                 proba_fn,
                 num_features=5,
-                num_samples=400,
+                num_samples=150,
             )
             w_map = {}
             for term, val in exp.as_list():
@@ -993,6 +1026,210 @@ def generate_weather(lat: float, lon: float, lead_day: int):
     return temp, rain, hum, wind, pres
 
 
+WMO_WEATHER_CODES = {
+    0: "Clear sky",
+    1: "Mainly clear",
+    2: "Partly cloudy",
+    3: "Overcast",
+    45: "Fog",
+    48: "Depositing rime fog",
+    51: "Light drizzle",
+    53: "Moderate drizzle",
+    55: "Dense drizzle",
+    56: "Light freezing drizzle",
+    57: "Dense freezing drizzle",
+    61: "Slight rain",
+    63: "Moderate rain",
+    65: "Heavy rain",
+    66: "Light freezing rain",
+    67: "Heavy freezing rain",
+    71: "Slight snow fall",
+    73: "Moderate snow fall",
+    75: "Heavy snow fall",
+    77: "Snow grains",
+    80: "Slight rain showers",
+    81: "Moderate rain showers",
+    82: "Violent rain showers",
+    85: "Slight snow showers",
+    86: "Heavy snow showers",
+    95: "Thunderstorm",
+    96: "Thunderstorm with slight hail",
+    99: "Thunderstorm with heavy hail",
+}
+
+HTTPX_CLIENT: httpx.AsyncClient | None = None
+OPENMETEO_CACHE = {}
+OPENMETEO_CACHE_TTL = 7200  # 2 hours in-memory cache
+
+
+async def fetch_openmeteo_10day_forecast(lat: float, lon: float) -> dict:
+    """Fetch real 10-day future weather prediction from Open-Meteo API with vectorized batch fallback."""
+    cache_key = (round(lat, 2), round(lon, 2))
+    now = time.time()
+
+    if cache_key in OPENMETEO_CACHE:
+        entry = OPENMETEO_CACHE[cache_key]
+        if now - entry["timestamp"] < OPENMETEO_CACHE_TTL:
+            return entry["data"]
+
+    url = (
+        f"https://api.open-meteo.com/v1/forecast"
+        f"?latitude={lat:.4f}&longitude={lon:.4f}"
+        f"&forecast_days=10&wind_speed_unit=ms&timezone=Asia%2FKolkata"
+        f"&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,wind_speed_10m_max"
+        f"&hourly=temperature_2m,relative_humidity_2m,surface_pressure,wind_speed_10m,precipitation"
+    )
+
+    client = HTTPX_CLIENT if HTTPX_CLIENT is not None else httpx.AsyncClient(timeout=3.5)
+    close_client = HTTPX_CLIENT is None
+
+    try:
+        resp = await client.get(url)
+        if resp.status_code == 200:
+            raw = resp.json()
+            daily = raw.get("daily", {})
+            hourly = raw.get("hourly", {})
+
+            times = daily.get("time", [])
+            codes = daily.get("weather_code", [])
+            t_maxs = daily.get("temperature_2m_max", [])
+            t_mins = daily.get("temperature_2m_min", [])
+            precips = daily.get("precipitation_sum", [])
+            winds = daily.get("wind_speed_10m_max", [])
+
+            h_temps = hourly.get("temperature_2m", [])
+            h_hums = hourly.get("relative_humidity_2m", [])
+            h_press = hourly.get("surface_pressure", [])
+            h_winds = hourly.get("wind_speed_10m", [])
+
+            weather_items = []
+            day_meta = []
+            for d in range(min(10, len(times))):
+                lead_day = d + 1
+                date_str = times[d]
+                w_code = codes[d] if d < len(codes) else 0
+                t_max = float(t_maxs[d]) if d < len(t_maxs) and t_maxs[d] is not None else 30.0
+                t_min = float(t_mins[d]) if d < len(t_mins) and t_mins[d] is not None else 22.0
+                rain_sum = float(precips[d]) if d < len(precips) and precips[d] is not None else 0.0
+                wind_max = float(winds[d]) if d < len(winds) and winds[d] is not None else 5.0
+
+                s_idx = d * 24
+                e_idx = s_idx + 24
+                day_temps = [v for v in h_temps[s_idx:e_idx] if v is not None]
+                day_hums = [v for v in h_hums[s_idx:e_idx] if v is not None]
+                day_press = [v for v in h_press[s_idx:e_idx] if v is not None]
+                day_winds = [v for v in h_winds[s_idx:e_idx] if v is not None]
+
+                temp_avg = float(np.mean(day_temps)) if day_temps else (t_max + t_min) / 2.0
+                hum_avg = float(np.mean(day_hums)) if day_hums else 60.0
+                pres_avg = float(np.mean(day_press)) if day_press else 1008.0
+                pres_drop = abs(1013.0 - pres_avg)
+
+                weather_items.append((lat, lon, temp_avg, rain_sum, hum_avg, wind_max, pres_avg))
+                day_meta.append((lead_day, date_str, w_code, t_max, t_min, temp_avg, rain_sum, hum_avg, wind_max, pres_avg, pres_drop))
+
+            # Vectorized batch prediction across all 10 days in one single pass
+            lead_days = [m[0] for m in day_meta]
+            batch_preds = ensemble.predict_batch(weather_items, lead_day=lead_days)
+
+            forecast_days = []
+            for idx, out in enumerate(batch_preds):
+                (lead_day, date_str, w_code, t_max, t_min, temp_avg, rain_sum, hum_avg, wind_max, pres_avg, pres_drop) = day_meta[idx]
+                prob = out[0]
+                driver = out[8]
+                sim_score = out[9]
+                event_name = out[10]
+                risk_level = "High" if prob >= 0.65 else ("Moderate" if prob >= 0.25 else "Low")
+                w_desc = WMO_WEATHER_CODES.get(w_code, "Partly cloudy")
+
+                forecast_days.append({
+                    "lead_day": lead_day,
+                    "date": date_str,
+                    "weather_code": w_code,
+                    "weather_desc": w_desc,
+                    "temp_max": round(t_max, 1),
+                    "temp_min": round(t_min, 1),
+                    "temp_avg": round(temp_avg, 1),
+                    "precipitation_mm": round(rain_sum, 1),
+                    "humidity_pct": round(hum_avg, 1),
+                    "wind_speed_ms": round(wind_max, 1),
+                    "pressure_hpa": round(pres_avg, 1),
+                    "pressure_drop_hpa": round(pres_drop, 1),
+                    "bust_prob": round(prob, 4),
+                    "risk_level": risk_level,
+                    "primary_driver": driver,
+                    "similarity_score": round(sim_score, 1),
+                    "past_event": event_name,
+                })
+
+            result = {
+                "source": "openmeteo",
+                "lat": lat,
+                "lon": lon,
+                "forecast": forecast_days,
+            }
+            OPENMETEO_CACHE[cache_key] = {"timestamp": now, "data": result}
+            return result
+    except Exception as e:
+        print(f"Open-Meteo fetch failed for ({lat}, {lon}): {e}. Using deterministic generator fallback.")
+    finally:
+        if close_client:
+            await client.aclose()
+
+    # Fast vectorized fallback across all 10 days
+    weather_items = []
+    day_meta = []
+    base_date = datetime.date.today()
+    for d in range(10):
+        lead_day = d + 1
+        day_date = (base_date + datetime.timedelta(days=d)).isoformat()
+        t, r, h, w, p = generate_weather(lat, lon, lead_day)
+        p_drop = abs(1013.0 - p)
+        weather_items.append((lat, lon, t, r, h, w, p))
+        day_meta.append((lead_day, day_date, t, r, h, w, p, p_drop))
+
+    batch_preds = ensemble.predict_batch(weather_items, lead_day=list(range(1, 11)))
+    fallback_days = []
+    for idx, out in enumerate(batch_preds):
+        (lead_day, day_date, t, r, h, w, p, p_drop) = day_meta[idx]
+        prob = out[0]
+        driver = out[8]
+        sim_score = out[9]
+        event_name = out[10]
+        risk_level = "High" if prob >= 0.65 else ("Moderate" if prob >= 0.25 else "Low")
+        w_desc = "Rain showers" if r > 15 else ("Slight rain" if r > 2 else "Clear sky")
+        w_code = 80 if r > 15 else (61 if r > 2 else 0)
+
+        fallback_days.append({
+            "lead_day": lead_day,
+            "date": day_date,
+            "weather_code": w_code,
+            "weather_desc": w_desc,
+            "temp_max": round(t + 2.0, 1),
+            "temp_min": round(t - 3.0, 1),
+            "temp_avg": round(t, 1),
+            "precipitation_mm": round(r, 1),
+            "humidity_pct": round(h, 1),
+            "wind_speed_ms": round(w, 1),
+            "pressure_hpa": round(p, 1),
+            "pressure_drop_hpa": round(p_drop, 1),
+            "bust_prob": round(prob, 4),
+            "risk_level": risk_level,
+            "primary_driver": driver,
+            "similarity_score": round(sim_score, 1),
+            "past_event": event_name,
+        })
+
+    result = {
+        "source": "fallback",
+        "lat": lat,
+        "lon": lon,
+        "forecast": fallback_days,
+    }
+    OPENMETEO_CACHE[cache_key] = {"timestamp": now, "data": result}
+    return result
+
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # FASTAPI LIFECYCLE & STARTUP
@@ -1000,15 +1237,25 @@ def generate_weather(lat: float, lon: float, lead_day: int):
 
 @app.on_event("startup")
 async def startup_event():
-    global BACKGROUND_DATA, LIME_EXPLAINER, GRID_COORDS, IN_MEMORY_WEATHER_CACHE
+    global BACKGROUND_DATA, LIME_EXPLAINER, GRID_COORDS, IN_MEMORY_WEATHER_CACHE, HTTPX_CLIENT, SHAP_TREE_EXPLAINER
+
+    HTTPX_CLIENT = httpx.AsyncClient(timeout=3.5)
 
     root_dir = os.path.dirname(__file__)
     ensemble.load(root_dir)
 
-    # 1. Load boundary polygons
+    # 1. Pre-cache SHAP TreeExplainer from loaded LightGBM Booster
+    if shap is not None and ensemble.lgb_booster is not None:
+        try:
+            SHAP_TREE_EXPLAINER = shap.TreeExplainer(ensemble.lgb_booster)
+            print("SHAP TreeExplainer initialised and cached successfully.")
+        except Exception as e:
+            print(f"Failed to initialise SHAP TreeExplainer: {e}")
+
+    # 2. Load boundary polygons
     load_india_boundary()
 
-    # 2. Generate candidate coordinates covering Indian subcontinent
+    # 3. Generate candidate coordinates covering Indian subcontinent
     lat_range = np.arange(8.0, 36.8, 0.25)
     lon_range = np.arange(68.5, 96.8, 0.25)
 
@@ -1089,6 +1336,13 @@ async def startup_event():
     print("VortexXAI operational ML model startup sequence complete.")
 
 
+@app.on_event("shutdown")
+async def shutdown_event():
+    global HTTPX_CLIENT
+    if HTTPX_CLIENT is not None:
+        await HTTPX_CLIENT.aclose()
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # REST API ENDPOINTS
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1140,11 +1394,25 @@ async def predict(req: PredictRequest):
 
 @app.post("/api/explain_point")
 async def explain_point(req: ExplainRequest):
-    """Dynamic Dual-Engine XAI (SHAP + LIME) Click-to-Explain endpoint."""
+    """Dynamic Dual-Engine XAI (SHAP + LIME) Click-to-Explain endpoint with Open-Meteo 10-day data."""
     lat, lon, lead_day = req.lat, req.lon, req.lead_day
 
-    # 1. Forward pass weather simulation & prediction
-    temp, rain, hum, wind, pres = generate_weather(lat, lon, lead_day)
+    # 1. Fetch 10-day Open-Meteo future forecast data
+    om_data = await fetch_openmeteo_10day_forecast(lat, lon)
+    om_forecast = om_data.get("forecast", [])
+    om_source = om_data.get("source", "fallback")
+
+    # Use real Open-Meteo forecast parameters for the requested lead_day if available
+    day_match = next((item for item in om_forecast if item["lead_day"] == lead_day), None)
+    if day_match and om_source == "openmeteo":
+        temp = day_match["temp_avg"]
+        rain = day_match["precipitation_mm"]
+        hum = day_match["humidity_pct"]
+        wind = day_match["wind_speed_ms"]
+        pres = day_match["pressure_hpa"]
+    else:
+        temp, rain, hum, wind, pres = generate_weather(lat, lon, lead_day)
+
     (prob, temp_anom, rain2, conv, hum_out, wind_out, pres_out,
      pres_drop, driver, sim_score, event_name) = ensemble.predict(
         temp, rain, hum, wind, pres, lead_day, lat, lon
@@ -1223,4 +1491,20 @@ async def explain_point(req: ExplainRequest):
         "feature_values": feature_values,
         "similarity_score": synoptic["similarity"],
         "past_event": synoptic["event"],
+        "openmeteo_10day": om_forecast,
+        "weather_source": om_source,
     }
+
+
+@app.get("/api/forecast_10day")
+async def get_forecast_10day(lat: float, lon: float):
+    """Return 10-day Open-Meteo future weather predictions and ML risk metrics for a location."""
+    data = await fetch_openmeteo_10day_forecast(lat, lon)
+    return {"status": "success", **data}
+
+
+@app.post("/api/forecast_10day")
+async def post_forecast_10day(req: Forecast10DayRequest):
+    """Return 10-day Open-Meteo future weather predictions and ML risk metrics for a location."""
+    data = await fetch_openmeteo_10day_forecast(req.lat, req.lon)
+    return {"status": "success", **data}

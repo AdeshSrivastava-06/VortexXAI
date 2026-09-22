@@ -13,6 +13,7 @@ function App() {
   const [leadDay, setLeadDay] = useState(1);
   const [gridData, setGridData] = useState<any[]>([]);
   const [loading, setLoading] = useState(false);
+  const [isExplaining, setIsExplaining] = useState(false);
   const [selectedGrid, setSelectedGrid] = useState<any>(null);
   const [explainData, setExplainData] = useState<any>(null);
   const [isDrawerCollapsed, setIsDrawerCollapsed] = useState(false);
@@ -63,23 +64,38 @@ function App() {
   // Fetch explainability point data when selectedGrid or leadDay updates
   useEffect(() => {
     if (!selectedGrid) return;
-    let isCurrent = true;
+    const controller = new AbortController();
+    setIsExplaining(true);
+
     const fetchExplain = async () => {
       try {
         const res = await fetch('http://localhost:8000/api/explain_point', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ lat: selectedGrid.lat, lon: selectedGrid.lon, lead_day: leadDay }),
+          signal: controller.signal,
         });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
-        if (isCurrent) setExplainData(data);
-      } catch (err) {
-        if (isCurrent) setExplainData(selectedGrid);
+        setExplainData(data);
+      } catch (err: any) {
+        if (err.name !== 'AbortError') {
+          console.error('Failed to fetch explain data', err);
+          // Fall back gracefully to selectedGrid data
+          setExplainData({
+            ...selectedGrid,
+            weather_source: 'fallback',
+          });
+        }
+      } finally {
+        if (!controller.signal.aborted) {
+          setIsExplaining(false);
+        }
       }
     };
     fetchExplain();
     return () => {
-      isCurrent = false;
+      controller.abort();
     };
   }, [selectedGrid?.id, leadDay]);
 
@@ -127,7 +143,12 @@ function App() {
   const sortedByRisk = [...gridData].sort((a, b) => b.bust_prob - a.bust_prob);
   const top12Risks = sortedByRisk.slice(0, 12);
 
-  const activeGrid = explainData || selectedGrid || (sortedByRisk.length > 0 ? sortedByRisk[0] : null);
+  const isExplainMatching = explainData && selectedGrid &&
+    Math.abs(explainData.lat - selectedGrid.lat) < 0.01 &&
+    Math.abs(explainData.lon - selectedGrid.lon) < 0.01;
+  const activeGrid = isExplainMatching
+    ? { ...selectedGrid, ...explainData }
+    : selectedGrid || (sortedByRisk.length > 0 ? sortedByRisk[0] : null);
 
   return (
     <div className="h-screen w-screen flex flex-col overflow-hidden bg-background">
@@ -181,9 +202,9 @@ function App() {
 
           {/* Fixed-width inference indicator */}
           <div className="flex items-center space-x-2 bg-accentSafe/10 px-3.5 py-1.5 rounded-lg border border-accentSafe/20 shadow-sm w-44 justify-center shrink-0">
-            <Server className={`w-4 h-4 shrink-0 ${loading ? 'animate-spin text-accentSafeCyan' : 'text-accentSafe'}`} />
+            <Server className={`w-4 h-4 shrink-0 ${loading || isExplaining ? 'animate-spin text-accentSafeCyan' : 'text-accentSafe'}`} />
             <span className="text-[13px] font-semibold text-accentSafe whitespace-nowrap">
-              {loading ? 'COMPUTING...' : 'INFERENCE ACTIVE'}
+              {loading ? 'COMPUTING GRID...' : isExplaining ? 'ANALYZING POINT...' : 'INFERENCE ACTIVE'}
             </span>
           </div>
         </div>
@@ -266,7 +287,7 @@ function App() {
                 maxSize="80%"
                 className="relative h-full bg-surface/80 backdrop-blur-md rounded-xl p-5 overflow-y-auto border border-white/10"
               >
-                <XAIDashboard activeGrid={activeGrid} leadDay={leadDay} />
+                <XAIDashboard activeGrid={activeGrid} leadDay={leadDay} onSelectLeadDay={setLeadDay} isExplaining={isExplaining} />
               </Panel>
 
             </PanelGroup>

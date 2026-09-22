@@ -1,9 +1,15 @@
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from 'recharts';
-import { BrainCircuit, History, ShieldAlert, MapPin, CheckCircle, AlertTriangle, Thermometer, Droplets, Wind, Gauge, CloudRain } from 'lucide-react';
+import {
+  BrainCircuit, History, ShieldAlert, MapPin, CheckCircle, AlertTriangle,
+  Thermometer, Droplets, Wind, Gauge, CloudRain, Calendar, CloudSun,
+  CloudDrizzle, CloudLightning, Sun
+} from 'lucide-react';
 
 interface XAIProps {
   activeGrid: any;
   leadDay: number;
+  onSelectLeadDay?: (day: number) => void;
+  isExplaining?: boolean;
 }
 
 // Helper to highlight key variables (locations, meteorological values, LIME weights, drivers)
@@ -81,7 +87,17 @@ const CustomTooltip = ({ active, payload }: any) => {
   return null;
 };
 
-export default function XAIDashboard({ activeGrid, leadDay }: XAIProps) {
+function getWeatherIcon(code: number) {
+  if (code === 0 || code === 1) return <Sun className="w-4 h-4 text-amber-400 shrink-0" />;
+  if (code === 2 || code === 3) return <CloudSun className="w-4 h-4 text-slate-300 shrink-0" />;
+  if (code >= 51 && code <= 57) return <CloudDrizzle className="w-4 h-4 text-blue-300 shrink-0" />;
+  if (code >= 61 && code <= 67) return <CloudRain className="w-4 h-4 text-blue-400 shrink-0" />;
+  if (code >= 80 && code <= 82) return <CloudRain className="w-4 h-4 text-cyan-400 shrink-0" />;
+  if (code >= 95) return <CloudLightning className="w-4 h-4 text-purple-400 shrink-0" />;
+  return <CloudSun className="w-4 h-4 text-slate-300 shrink-0" />;
+}
+
+export default function XAIDashboard({ activeGrid, leadDay, onSelectLeadDay, isExplaining }: XAIProps) {
   if (!activeGrid) {
     return (
       <div className="h-full flex flex-col items-center justify-center text-slate-400 space-y-3">
@@ -115,6 +131,8 @@ export default function XAIDashboard({ activeGrid, leadDay }: XAIProps) {
   const prob = activeGrid.bust_prob || 0;
   const district = activeGrid.district_name || 'Unknown';
   const state = activeGrid.state_name || 'Unknown';
+  const openMeteo10Day = activeGrid.openmeteo_10day || null;
+  const weatherSource = activeGrid.weather_source || 'deterministic';
 
   // ─── Feature values ─────────────────────────────────────────────────
   const featureValues = activeGrid.feature_values || {
@@ -184,11 +202,20 @@ export default function XAIDashboard({ activeGrid, leadDay }: XAIProps) {
         <p className="text-sm text-slate-400 mt-1">
           {activeGrid.lat?.toFixed(2)}°N, {activeGrid.lon?.toFixed(2)}°E &nbsp;·&nbsp; Lead Day +{leadDay}
         </p>
-        <div className="mt-3 flex items-baseline space-x-2">
-          <span className="text-4xl font-bold font-mono" style={{ color: probColor }}>
-            {(prob * 100).toFixed(1)}%
-          </span>
-          <span className="text-lg text-slate-400 font-medium">Bust Risk</span>
+        <div className="mt-3 flex items-center justify-between">
+          <div className="flex items-baseline space-x-2">
+            <span className="text-4xl font-bold font-mono" style={{ color: probColor }}>
+              {(prob * 100).toFixed(1)}%
+            </span>
+            <span className="text-lg text-slate-400 font-medium">Bust Risk</span>
+          </div>
+
+          <div className="flex items-center space-x-2 bg-slate-800/80 border border-slate-700/70 px-3 py-1.5 rounded-lg shadow-sm">
+            <span className={`w-2 h-2 rounded-full ${isExplaining ? 'bg-cyan-400 animate-ping' : weatherSource === 'openmeteo' ? 'bg-emerald-400 animate-pulse' : 'bg-cyan-400'}`} />
+            <span className="text-xs font-semibold text-slate-200">
+              {isExplaining ? 'Analyzing Point...' : weatherSource === 'openmeteo' ? 'Open-Meteo 10-Day Feed' : 'Deterministic Model'}
+            </span>
+          </div>
         </div>
       </div>
 
@@ -209,6 +236,84 @@ export default function XAIDashboard({ activeGrid, leadDay }: XAIProps) {
           </div>
         ))}
       </div>
+
+      {/* ═══════ 10-Day Open-Meteo Future Forecast & Risk Outlook ═══════ */}
+      {openMeteo10Day && openMeteo10Day.length > 0 ? (
+        <div className="border border-slate-700/50 bg-slate-800/40 rounded-xl p-4">
+          <div className="flex items-center justify-between mb-3">
+            <div className="flex items-center space-x-2">
+              <Calendar className="w-4.5 h-4.5 text-cyan-400" />
+              <h3 className="text-sm font-bold text-slate-200 uppercase tracking-wider">
+                Open-Meteo 10-Day Future Outlook
+              </h3>
+            </div>
+            <span className="text-xs text-slate-400">
+              Click any day to jump to that lead day
+            </span>
+          </div>
+
+          <div className="flex space-x-2.5 overflow-x-auto pb-2 scrollbar-thin scrollbar-thumb-slate-700 scrollbar-track-transparent">
+            {openMeteo10Day.map((day: any) => {
+              const isSelected = day.lead_day === leadDay;
+              const dRiskBg = day.bust_prob >= 0.65
+                ? 'bg-red-500/15 text-red-300 border-red-500/30'
+                : (day.bust_prob >= 0.25
+                  ? 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+                  : 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30');
+
+              return (
+                <div
+                  key={day.lead_day}
+                  onClick={() => onSelectLeadDay?.(day.lead_day)}
+                  className={`flex flex-col min-w-[125px] max-w-[125px] p-2.5 rounded-lg border cursor-pointer transition-all shrink-0 ${
+                    isSelected
+                      ? 'border-cyan-400 bg-slate-700/90 shadow-lg ring-1 ring-cyan-400'
+                      : 'border-slate-700/60 bg-slate-800/70 hover:bg-slate-700/50 hover:border-slate-500'
+                  }`}
+                >
+                  <div className="flex items-center justify-between">
+                    <span className={`text-xs font-bold font-mono ${isSelected ? 'text-cyan-300 font-extrabold' : 'text-slate-400'}`}>
+                      Day +{day.lead_day}
+                    </span>
+                    {isSelected && (
+                      <span className="w-1.5 h-1.5 rounded-full bg-cyan-400" />
+                    )}
+                  </div>
+
+                  <span className="text-[11px] text-slate-400 mt-0.5">
+                    {day.date.slice(5)}
+                  </span>
+
+                  <div className="flex items-center space-x-1.5 my-2">
+                    {getWeatherIcon(day.weather_code)}
+                    <span className="text-xs font-medium text-slate-200 truncate" title={day.weather_desc}>
+                      {day.weather_desc}
+                    </span>
+                  </div>
+
+                  <div className="text-xs font-mono font-semibold text-white">
+                    {day.temp_min}° - {day.temp_max}°C
+                  </div>
+
+                  <div className="flex items-center justify-between text-[11px] text-slate-400 mt-1">
+                    <span>🌧️ {day.precipitation_mm}mm</span>
+                    <span>💨 {day.wind_speed_ms}m/s</span>
+                  </div>
+
+                  <div className={`mt-2 text-center py-0.5 px-1 rounded text-[11px] font-mono font-bold border ${dRiskBg}`}>
+                    {(day.bust_prob * 100).toFixed(1)}% Risk
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      ) : isExplaining ? (
+        <div className="border border-slate-700/50 bg-slate-800/30 rounded-xl p-4 flex items-center justify-center space-x-3 text-slate-400 animate-pulse">
+          <div className="w-4 h-4 border-2 border-cyan-400 border-t-transparent rounded-full animate-spin" />
+          <span className="text-xs font-medium text-slate-300">Fetching 10-day Open-Meteo forecast...</span>
+        </div>
+      ) : null}
 
       {/* ═══════ SHAP Feature Impact Chart ═══════ */}
       <div className="border border-slate-700/50 bg-slate-800/40 rounded-xl p-5" style={{ minHeight: '270px' }}>
