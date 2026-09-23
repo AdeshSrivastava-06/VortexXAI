@@ -7,7 +7,11 @@ backend_dir = os.path.dirname(__file__)
 if backend_dir not in sys.path:
     sys.path.insert(0, backend_dir)
 
-from main import app, startup_event, predict, explain_point, PredictRequest, ExplainRequest, ensemble
+from main import (
+    app, startup_event, predict, explain_point,
+    get_forecast_10day, fetch_openmeteo_10day_forecast,
+    PredictRequest, ExplainRequest, ensemble
+)
 
 async def main():
     print("=== Running VortexXAI End-to-End ML Pipeline Verification ===")
@@ -47,8 +51,24 @@ async def main():
     sample_pt = res_pred['data'][0]
     print(f"Sample Point: ID={sample_pt.id}, State={sample_pt.state_name}, Risk={sample_pt.bust_prob}, Driver={sample_pt.primary_driver}")
 
-    # 5. Test Explain Point Endpoint
-    print("\n--- 5. Testing /api/explain_point Endpoint (SHAP + LIME) ---")
+    # 5. Test Open-Meteo 10-day future forecast service
+    print("\n--- 5. Testing Open-Meteo 10-Day Future Forecast Service ---")
+    om_res = await fetch_openmeteo_10day_forecast(lat=28.61, lon=77.23)
+    print(f"Open-Meteo response source: {om_res['source']}, forecast days: {len(om_res['forecast'])}")
+    assert len(om_res['forecast']) == 10, "Open-Meteo should return 10 days of future predictions!"
+    day1 = om_res['forecast'][0]
+    day10 = om_res['forecast'][9]
+    print(f"Day +1: {day1['date']} | {day1['weather_desc']} | Temp: {day1['temp_min']} - {day1['temp_max']}°C | Rain: {day1['precipitation_mm']}mm | Bust Risk: {day1['bust_prob']*100:.1f}%")
+    print(f"Day +10: {day10['date']} | {day10['weather_desc']} | Temp: {day10['temp_min']} - {day10['temp_max']}°C | Rain: {day10['precipitation_mm']}mm | Bust Risk: {day10['bust_prob']*100:.1f}%")
+
+    # 6. Test /api/forecast_10day endpoint
+    print("\n--- 6. Testing /api/forecast_10day Endpoint ---")
+    ep_res = await get_forecast_10day(lat=19.07, lon=72.87)
+    assert ep_res['status'] == 'success'
+    assert len(ep_res['forecast']) == 10
+
+    # 7. Test Explain Point Endpoint (SHAP + LIME + Open-Meteo integration)
+    print("\n--- 7. Testing /api/explain_point Endpoint (SHAP + LIME + Open-Meteo) ---")
     req_exp = ExplainRequest(lat=15.5, lon=73.83, lead_day=3)
     res_exp = await explain_point(req_exp)
     print(f"Explain Point Response keys: {list(res_exp.keys())}")
@@ -58,12 +78,15 @@ async def main():
     print(f"LIME Weights: {res_exp['lime_weights']}")
     print(f"LIME Agreement: {res_exp['lime_agreement']}")
     print(f"Dynamic Insight: {res_exp['dynamic_insight']}")
+    print(f"Weather Source: {res_exp.get('weather_source')}")
+    print(f"Open-Meteo 10-day items: {len(res_exp.get('openmeteo_10day', []))}")
 
     assert len(res_exp['shap_values']) == 5, "Should compute SHAP values for all 5 features!"
     assert len(res_exp['lime_weights']) == 5, "Should compute LIME weights for all 5 features!"
     assert len(res_exp['dynamic_insight']) > 10, "Should return dynamic operational insight!"
+    assert len(res_exp.get('openmeteo_10day', [])) == 10, "Should include 10 days of Open-Meteo future data!"
 
-    print("\n[SUCCESS] ALL VERIFICATION TESTS PASSED SUCCESSFULLY!")
+    print("\n[SUCCESS] ALL VERIFICATION TESTS (INCLUDING OPEN-METEO 10-DAY FORECAST) PASSED SUCCESSFULLY!")
 
 if __name__ == "__main__":
     asyncio.run(main())
