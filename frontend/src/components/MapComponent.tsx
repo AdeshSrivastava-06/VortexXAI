@@ -64,9 +64,9 @@ interface MapProps {
   data: GridPoint[];
   selectedGridId: string | null;
   onSelectGrid: (grid: GridPoint) => void;
+  focusPoint?: { lat: number; lon: number } | null;
 }
 
-// Coordinate helper to strictly extract pure floating-point coordinates
 const getLon = (d: GridPoint): number => Number(d.longitude ?? d.lon ?? 0.0);
 const getLat = (d: GridPoint): number => Number(d.latitude ?? d.lat ?? 0.0);
 
@@ -74,6 +74,7 @@ export default function MapComponent({
   data,
   selectedGridId,
   onSelectGrid,
+  focusPoint,
 }: MapProps) {
   const [viewState, setViewState] = useState(INITIAL_VIEW_STATE);
   const [hoverInfo, setHoverInfo] = useState<any>(null);
@@ -93,20 +94,30 @@ export default function MapComponent({
     }));
   }, [selectedGridId]);
 
+  useEffect(() => {
+    if (!focusPoint) return;
+    setViewState((currentView) => ({
+      ...currentView,
+      longitude: focusPoint.lon,
+      latitude: focusPoint.lat,
+      zoom: Math.max(currentView.zoom, 6.2),
+      transitionDuration: 900,
+    }));
+  }, [focusPoint]);
+
   const getColor = (
     prob: number,
     isSelected: boolean,
   ): [number, number, number, number] => {
     if (isSelected) return [255, 255, 255, 255];
-    if (prob >= 0.65) return [239, 68, 68, 230]; // Crimson Red
-    if (prob >= 0.25) return [245, 158, 11, 210]; // Amber
+    if (prob > 0.5) return [239, 68, 68, 230]; // Crimson Red
+    if (prob > 0.3) return [245, 158, 11, 210]; // Amber
     return [16, 185, 129, 150]; // Emerald Green
   };
 
   const getElevation = (prob: number): number => {
-    if (prob < 0.15) return 2500;
-    if (prob < 0.25) return 10000;
-    if (prob < 0.65) return Math.pow(prob, 1.5) * 200000;
+    if (prob <= 0.3) return 2500;
+    if (prob <= 0.5) return Math.pow(prob, 1.5) * 120000;
     return Math.pow(prob, 2) * 350000;
   };
 
@@ -220,6 +231,14 @@ export default function MapComponent({
 
           const lonVal = getLon(obj);
           const latVal = getLat(obj);
+          const riskPct = obj.bust_prob * 100;
+          const confidencePct = 100 - riskPct;
+          const confidenceColor =
+            confidencePct >= 70
+              ? "#34D399"
+              : confidencePct >= 40
+                ? "#FBBF24"
+                : "#F87171";
 
           return (
             <div
@@ -239,18 +258,36 @@ export default function MapComponent({
               <div className="text-slate-300 text-xs font-mono">
                 {latVal.toFixed(2)}°N, {lonVal.toFixed(2)}°E
               </div>
-              <div
-                className="mt-2.5 text-2xl font-extrabold font-mono"
-                style={{
-                  color:
-                    obj.bust_prob >= 0.65
-                      ? "#EF4444"
-                      : obj.bust_prob >= 0.25
-                        ? "#F59E0B"
-                        : "#10B981",
-                }}
-              >
-                {(obj.bust_prob * 100).toFixed(1)}% Risk
+              <div className="mt-2.5 flex items-end gap-2">
+                <div className="flex-1 min-w-0">
+                  <div
+                    className="text-xl font-extrabold font-mono"
+                    style={{
+                      color:
+                        obj.bust_prob > 0.5
+                          ? "#EF4444"
+                          : obj.bust_prob > 0.3
+                            ? "#F59E0B"
+                            : "#10B981",
+                    }}
+                  >
+                    {riskPct.toFixed(1)}%
+                  </div>
+                  <div className="text-[11px] font-semibold text-slate-300">
+                    Risk
+                  </div>
+                </div>
+                <div className="flex-1 min-w-0">
+                  <div
+                    className="text-xl font-extrabold font-mono"
+                    style={{ color: confidenceColor }}
+                  >
+                    {confidencePct.toFixed(1)}%
+                  </div>
+                  <div className="text-[11px] font-semibold text-slate-300 whitespace-nowrap">
+                    NWP Confidence
+                  </div>
+                </div>
               </div>
               <div className="text-slate-300 text-xs mt-2 font-medium flex items-center space-x-1.5 bg-slate-800/80 px-2.5 py-1 rounded-md border border-slate-700/50">
                 <span className="text-slate-400">Driver:</span>

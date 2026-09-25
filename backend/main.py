@@ -1,6 +1,7 @@
 import os
 import math
 import time
+import asyncio
 import datetime
 import json
 import httpx
@@ -440,6 +441,129 @@ def match_synoptic_pattern(
         "similarity": score_pct,
         "cosine_sim": round(best_cos_sim, 3),
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LIVE OPEN-METEO → CONVLSTM SPATIAL TENSOR BUILDER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _clean_hourly_series(values, fallback: float) -> list[float]:
+    return [float(v) if v is not None else fallback for v in (values or [])]
+
+
+def _slice_hourly_for_lead(series: list[float], lead_day: int | None, fallback: float) -> list[float]:
+    """Keep the 24-hour lead-time window for a specific forecast day when requested."""
+    if not series:
+        return [fallback]
+    if lead_day is None:
+        return series
+    start = max(0, (int(lead_day) - 1) * 24)
+    end = start + 24
+    window = series[start:end]
+    return window if window else series
+
+
+def build_live_convlstm_tensor(
+    openmeteo_hourly: dict,
+    lat: float,
+    lon: float,
+    target_h: int = 13,
+    target_w: int = 13,
+    seq_len: int = 5,
+    lead_day: int | None = None,
+) -> np.ndarray:
+    """Construct a spatial tensor for ConvLSTM directly from live Open-Meteo hourly arrays.
+
+    Reshapes the 1D hourly time-series (precipitation + CAPE included) into a
+    (1, seq_len, 4, H, W) spatial tensor by tiling scalar hourly aggregates across
+    the spatial grid with a Gaussian kernel centered on (lat, lon).
+    """
+    h_temps = _slice_hourly_for_lead(_clean_hourly_series(openmeteo_hourly.get("temperature_2m"), 25.0), lead_day, 25.0)
+    h_press = _slice_hourly_for_lead(_clean_hourly_series(openmeteo_hourly.get("surface_pressure"), 1013.0), lead_day, 1013.0)
+    h_winds = _slice_hourly_for_lead(_clean_hourly_series(openmeteo_hourly.get("wind_speed_10m"), 5.0), lead_day, 5.0)
+    h_hums = _slice_hourly_for_lead(_clean_hourly_series(openmeteo_hourly.get("relative_humidity_2m"), 60.0), lead_day, 60.0)
+    h_precips = _slice_hourly_for_lead(_clean_hourly_series(openmeteo_hourly.get("precipitation"), 0.0), lead_day, 0.0)
+    h_cape = _slice_hourly_for_lead(_clean_hourly_series(openmeteo_hourly.get("cape"), 0.0), lead_day, 0.0)
+
+    total_hours = max(len(h_temps), len(h_precips), len(h_cape), 1)
+    hours_per_step = max(1, total_hours // seq_len)
+
+    tensor = np.zeros((1, seq_len, 4, target_h, target_w), dtype=np.float32)
+
+    # Create a spatial perturbation kernel centered at grid midpoint
+    rng = np.random.default_rng(int(abs(lat * 100) + abs(lon * 100)) % 100000)
+    cy, cx = target_h // 2, target_w // 2
+    yy, xx = np.mgrid[0:target_h, 0:target_w]
+    gauss = np.exp(-((yy - cy)**2 + (xx - cx)**2) / (2 * 3.0**2)).astype(np.float32)
+
+    for t in range(seq_len):
+        s = t * hours_per_step
+        e = min(s + hours_per_step, total_hours)
+        if s >= total_hours:
+            s, e = max(0, total_hours - hours_per_step), total_hours
+
+        slice_temps = h_temps[s:e] or [25.0]
+        slice_press = h_press[s:e] or [1013.0]
+        slice_winds = h_winds[s:e] or [5.0]
+        slice_hums = h_hums[s:e] or [60.0]
+        slice_precips = h_precips[s:e] or [0.0]
+        slice_cape = h_cape[s:e] or [0.0]
+
+        mean_temp = float(np.mean(slice_temps))
+        mean_pres = float(np.mean(slice_press))
+        mean_wind = float(np.mean(slice_winds))
+        mean_hum = float(np.mean(slice_hums))
+        mean_rain = float(np.sum(slice_precips))
+        mean_cape = float(np.mean(slice_cape))
+
+        # Normalized channels: temp_anom, pressure_dev, wind, humidity
+        # Incorporate precipitation and CAPE into the temp and pressure channels respectively
+        noise = rng.uniform(-0.05, 0.05, size=(4, target_h, target_w)).astype(np.float32)
+
+        c0 = (np.abs(mean_temp - 25.0) + mean_rain * 0.1) / 25.0  # temp anomaly + rain signal
+        c1 = (np.abs(1013.0 - mean_pres) + mean_cape * 0.005) / 35.0  # pressure dev + CAPE signal
+        c2 = mean_wind / 40.0
+        c3 = mean_hum / 100.0
+
+        tensor[0, t, 0] = c0 * gauss + noise[0]
+        tensor[0, t, 1] = c1 * gauss + noise[1]
+        tensor[0, t, 2] = c2 * gauss + noise[2]
+        tensor[0, t, 3] = c3 * gauss + noise[3]
+
+    tensor = np.clip(tensor, 0.0, 1.0)
+    return tensor
+
+
+LIVE_OPENMETEO_HOURLY_CACHE: dict = {}  # (lat, lon) -> raw hourly arrays for ConvLSTM
+LIVE_OPENMETEO_DAILY_CACHE: dict = {}   # (lat, lon) -> {lead_day: (temp, rain, hum, wind, pres)}
+LIVE_OPENMETEO_HUB_TS: float = 0.0
+LIVE_OPENMETEO_HUB_LOCK = asyncio.Lock()
+
+
+def get_live_hourly(lat: float, lon: float) -> dict | None:
+    """Nearest cached live Open-Meteo hourly payload for a grid coordinate."""
+    if not LIVE_OPENMETEO_HOURLY_CACHE:
+        return None
+    exact = (round(lat, 2), round(lon, 2))
+    if exact in LIVE_OPENMETEO_HOURLY_CACHE:
+        return LIVE_OPENMETEO_HOURLY_CACHE[exact]
+    nearest = min(
+        LIVE_OPENMETEO_HOURLY_CACHE.keys(),
+        key=lambda c: (c[0] - lat) ** 2 + (c[1] - lon) ** 2,
+    )
+    return LIVE_OPENMETEO_HOURLY_CACHE[nearest]
+
+
+def get_live_daily_weather(lat: float, lon: float, lead_day: int):
+    """Nearest cached live Open-Meteo daily aggregates (temp, rain, hum, wind, pres)."""
+    if not LIVE_OPENMETEO_DAILY_CACHE:
+        return None
+    exact = (round(lat, 2), round(lon, 2))
+    hub = exact if exact in LIVE_OPENMETEO_DAILY_CACHE else min(
+        LIVE_OPENMETEO_DAILY_CACHE.keys(),
+        key=lambda c: (c[0] - lat) ** 2 + (c[1] - lon) ** 2,
+    )
+    return LIVE_OPENMETEO_DAILY_CACHE[hub].get(int(lead_day))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1057,9 +1181,174 @@ WMO_WEATHER_CODES = {
     99: "Thunderstorm with heavy hail",
 }
 
+
+def _deterministic_10day_forecast(lat: float, lon: float) -> dict:
+    """Build the forecast-card response from the deterministic model stream."""
+    weather_items = []
+    day_meta = []
+    base_date = datetime.date.today()
+
+    for day_index in range(10):
+        lead_day = day_index + 1
+        temp, rain, hum, wind, pres = generate_weather(lat, lon, lead_day)
+        pressure_drop = abs(1013.0 - pres)
+        weather_items.append((lat, lon, temp, rain, hum, wind, pres))
+        day_meta.append((lead_day, (base_date + datetime.timedelta(days=day_index)).isoformat(), temp, rain, hum, wind, pres, pressure_drop))
+
+    batch_outputs = ensemble.predict_batch(weather_items, lead_day=list(range(1, 11)))
+    forecast = []
+    for meta, output in zip(day_meta, batch_outputs):
+        lead_day, date_str, temp, rain, hum, wind, pres, pressure_drop = meta
+        prob = output[0]
+        rain_code = 80 if rain > 15 else (61 if rain > 2 else 0)
+        forecast.append({
+            "lead_day": lead_day,
+            "date": date_str,
+            "weather_code": rain_code,
+            "weather_desc": "Rain showers" if rain > 15 else ("Slight rain" if rain > 2 else "Clear sky"),
+            "temp_max": round(temp + 2.0, 1),
+            "temp_min": round(temp - 3.0, 1),
+            "temp_avg": round(temp, 1),
+            "precipitation_mm": round(rain, 1),
+            "cape_jkg": 0.0,
+            "humidity_pct": round(hum, 1),
+            "wind_speed_ms": round(wind, 1),
+            "pressure_hpa": round(pres, 1),
+            "pressure_drop_hpa": round(pressure_drop, 1),
+            "bust_prob": round(prob, 4),
+            "confidence_pct": round((1.0 - float(prob)) * 100.0, 1),
+            "risk_level": "High" if prob > 0.5 else ("Moderate" if prob > 0.3 else "Low"),
+            "primary_driver": output[8],
+            "similarity_score": round(output[9], 1),
+            "past_event": output[10],
+        })
+
+    return {"source": "deterministic", "lat": lat, "lon": lon, "forecast": forecast}
+
 HTTPX_CLIENT: httpx.AsyncClient | None = None
 OPENMETEO_CACHE = {}
 OPENMETEO_CACHE_TTL = 7200  # 2 hours in-memory cache
+
+OPENMETEO_HOURLY_VARS = "precipitation,temperature_2m,relative_humidity_2m,surface_pressure,wind_speed_10m,cape"
+OPENMETEO_DAILY_VARS = "weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,wind_speed_10m_max"
+
+
+def _openmeteo_forecast_url(lat_csv: str, lon_csv: str) -> str:
+    return (
+        f"https://api.open-meteo.com/v1/forecast"
+        f"?latitude={lat_csv}&longitude={lon_csv}"
+        f"&forecast_days=10&wind_speed_unit=ms&timezone=Asia%2FKolkata"
+        f"&daily={OPENMETEO_DAILY_VARS}"
+        f"&hourly={OPENMETEO_HOURLY_VARS}"
+    )
+
+
+def _hourly_day_values(series, day_idx: int) -> list[float]:
+    """24-hour lead-time slice; ignores nulls so precipitation/CAPE stay real-valued."""
+    start, end = day_idx * 24, day_idx * 24 + 24
+    return [float(v) for v in (series or [])[start:end] if v is not None]
+
+
+def _ingest_openmeteo_payload(raw: dict, lat: float, lon: float) -> tuple[list, list]:
+    """Parse live Open-Meteo daily+hourly arrays into 10-day aggregates and cache tensors.
+
+    Hourly precipitation is summed and hourly CAPE is averaged across each 24-hour
+    lead-time window. Those live arrays are stored for ConvLSTM tensor construction.
+    """
+    daily = raw.get("daily", {}) or {}
+    hourly = raw.get("hourly", {}) or {}
+
+    cache_key = (round(lat, 2), round(lon, 2))
+    LIVE_OPENMETEO_HOURLY_CACHE[cache_key] = {
+        "temperature_2m": hourly.get("temperature_2m") or [],
+        "relative_humidity_2m": hourly.get("relative_humidity_2m") or [],
+        "surface_pressure": hourly.get("surface_pressure") or [],
+        "wind_speed_10m": hourly.get("wind_speed_10m") or [],
+        "precipitation": hourly.get("precipitation") or [],
+        "cape": hourly.get("cape") or [],
+    }
+
+    times = daily.get("time", []) or []
+    n_days = min(10, len(times) if times else 10)
+    if not times:
+        base = datetime.date.today()
+        times = [(base + datetime.timedelta(days=d)).isoformat() for d in range(10)]
+        n_days = 10
+
+    codes = daily.get("weather_code", []) or []
+    t_maxs = daily.get("temperature_2m_max", []) or []
+    t_mins = daily.get("temperature_2m_min", []) or []
+
+    weather_items = []
+    day_meta = []
+    daily_by_lead = {}
+
+    for d in range(n_days):
+        lead_day = d + 1
+        date_str = times[d] if d < len(times) else (datetime.date.today() + datetime.timedelta(days=d)).isoformat()
+        w_code = codes[d] if d < len(codes) and codes[d] is not None else 0
+        t_max = float(t_maxs[d]) if d < len(t_maxs) and t_maxs[d] is not None else 30.0
+        t_min = float(t_mins[d]) if d < len(t_mins) and t_mins[d] is not None else 22.0
+
+        day_temps = _hourly_day_values(hourly.get("temperature_2m"), d)
+        day_hums = _hourly_day_values(hourly.get("relative_humidity_2m"), d)
+        day_press = _hourly_day_values(hourly.get("surface_pressure"), d)
+        day_winds = _hourly_day_values(hourly.get("wind_speed_10m"), d)
+        day_precips = _hourly_day_values(hourly.get("precipitation"), d)
+        day_cape = _hourly_day_values(hourly.get("cape"), d)
+
+        rain_sum = float(np.sum(day_precips)) if day_precips else 0.0
+        cape_mean = float(np.mean(day_cape)) if day_cape else 0.0
+        temp_avg = float(np.mean(day_temps)) if day_temps else (t_max + t_min) / 2.0
+        hum_avg = float(np.mean(day_hums)) if day_hums else 60.0
+        pres_avg = float(np.mean(day_press)) if day_press else 1008.0
+        wind_mean = float(np.mean(day_winds)) if day_winds else 5.0
+        pres_drop = abs(1013.0 - pres_avg)
+
+        weather_items.append((lat, lon, temp_avg, rain_sum, hum_avg, wind_mean, pres_avg))
+        day_meta.append((
+            lead_day, date_str, w_code, t_max, t_min, temp_avg, rain_sum,
+            hum_avg, wind_mean, pres_avg, pres_drop, cape_mean,
+        ))
+        daily_by_lead[lead_day] = (temp_avg, rain_sum, hum_avg, wind_mean, pres_avg)
+
+    LIVE_OPENMETEO_DAILY_CACHE[cache_key] = daily_by_lead
+    return weather_items, day_meta
+
+
+def _forecast_days_from_batch(day_meta: list, batch_preds: list) -> list[dict]:
+    forecast_days = []
+    for idx, out in enumerate(batch_preds):
+        (lead_day, date_str, w_code, t_max, t_min, temp_avg, rain_sum,
+         hum_avg, wind_mean, pres_avg, pres_drop, cape_mean) = day_meta[idx]
+        prob = out[0]
+        driver = out[8]
+        sim_score = out[9]
+        event_name = out[10]
+        risk_level = "High" if prob > 0.5 else ("Moderate" if prob > 0.3 else "Low")
+        w_desc = WMO_WEATHER_CODES.get(w_code, "Partly cloudy")
+        forecast_days.append({
+            "lead_day": lead_day,
+            "date": date_str,
+            "weather_code": w_code,
+            "weather_desc": w_desc,
+            "temp_max": round(t_max, 1),
+            "temp_min": round(t_min, 1),
+            "temp_avg": round(temp_avg, 1),
+            "precipitation_mm": round(rain_sum, 1),
+            "cape_jkg": round(cape_mean, 1),
+            "humidity_pct": round(hum_avg, 1),
+            "wind_speed_ms": round(wind_mean, 1),
+            "pressure_hpa": round(pres_avg, 1),
+            "pressure_drop_hpa": round(pres_drop, 1),
+            "bust_prob": round(prob, 4),
+            "confidence_pct": round((1.0 - float(prob)) * 100.0, 1),
+            "risk_level": risk_level,
+            "primary_driver": driver,
+            "similarity_score": round(sim_score, 1),
+            "past_event": event_name,
+        })
+    return forecast_days
 
 
 async def fetch_openmeteo_10day_forecast(lat: float, lon: float) -> dict:
@@ -1072,101 +1361,25 @@ async def fetch_openmeteo_10day_forecast(lat: float, lon: float) -> dict:
         if now - entry["timestamp"] < OPENMETEO_CACHE_TTL:
             return entry["data"]
 
-    url = (
-        f"https://api.open-meteo.com/v1/forecast"
-        f"?latitude={lat:.4f}&longitude={lon:.4f}"
-        f"&forecast_days=10&wind_speed_unit=ms&timezone=Asia%2FKolkata"
-        f"&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,wind_speed_10m_max"
-        f"&hourly=temperature_2m,relative_humidity_2m,surface_pressure,wind_speed_10m,precipitation"
-    )
+    url = _openmeteo_forecast_url(f"{lat:.4f}", f"{lon:.4f}")
 
-    client = HTTPX_CLIENT if HTTPX_CLIENT is not None else httpx.AsyncClient(timeout=3.5)
+    client = HTTPX_CLIENT if HTTPX_CLIENT is not None else httpx.AsyncClient(timeout=10.0)
     close_client = HTTPX_CLIENT is None
 
     try:
         resp = await client.get(url)
         if resp.status_code == 200:
             raw = resp.json()
-            daily = raw.get("daily", {})
-            hourly = raw.get("hourly", {})
-
-            times = daily.get("time", [])
-            codes = daily.get("weather_code", [])
-            t_maxs = daily.get("temperature_2m_max", [])
-            t_mins = daily.get("temperature_2m_min", [])
-            precips = daily.get("precipitation_sum", [])
-            winds = daily.get("wind_speed_10m_max", [])
-
-            h_temps = hourly.get("temperature_2m", [])
-            h_hums = hourly.get("relative_humidity_2m", [])
-            h_press = hourly.get("surface_pressure", [])
-            h_winds = hourly.get("wind_speed_10m", [])
-
-            weather_items = []
-            day_meta = []
-            for d in range(min(10, len(times))):
-                lead_day = d + 1
-                date_str = times[d]
-                w_code = codes[d] if d < len(codes) else 0
-                t_max = float(t_maxs[d]) if d < len(t_maxs) and t_maxs[d] is not None else 30.0
-                t_min = float(t_mins[d]) if d < len(t_mins) and t_mins[d] is not None else 22.0
-                rain_sum = float(precips[d]) if d < len(precips) and precips[d] is not None else 0.0
-                wind_max = float(winds[d]) if d < len(winds) and winds[d] is not None else 5.0
-
-                s_idx = d * 24
-                e_idx = s_idx + 24
-                day_temps = [v for v in h_temps[s_idx:e_idx] if v is not None]
-                day_hums = [v for v in h_hums[s_idx:e_idx] if v is not None]
-                day_press = [v for v in h_press[s_idx:e_idx] if v is not None]
-                day_winds = [v for v in h_winds[s_idx:e_idx] if v is not None]
-
-                temp_avg = float(np.mean(day_temps)) if day_temps else (t_max + t_min) / 2.0
-                hum_avg = float(np.mean(day_hums)) if day_hums else 60.0
-                pres_avg = float(np.mean(day_press)) if day_press else 1008.0
-                pres_drop = abs(1013.0 - pres_avg)
-
-                weather_items.append((lat, lon, temp_avg, rain_sum, hum_avg, wind_max, pres_avg))
-                day_meta.append((lead_day, date_str, w_code, t_max, t_min, temp_avg, rain_sum, hum_avg, wind_max, pres_avg, pres_drop))
-
-            # Vectorized batch prediction across all 10 days in one single pass
+            if isinstance(raw, list):
+                raw = raw[0] if raw else {}
+            weather_items, day_meta = _ingest_openmeteo_payload(raw, lat, lon)
             lead_days = [m[0] for m in day_meta]
             batch_preds = ensemble.predict_batch(weather_items, lead_day=lead_days)
-
-            forecast_days = []
-            for idx, out in enumerate(batch_preds):
-                (lead_day, date_str, w_code, t_max, t_min, temp_avg, rain_sum, hum_avg, wind_max, pres_avg, pres_drop) = day_meta[idx]
-                prob = out[0]
-                driver = out[8]
-                sim_score = out[9]
-                event_name = out[10]
-                risk_level = "High" if prob >= 0.65 else ("Moderate" if prob >= 0.25 else "Low")
-                w_desc = WMO_WEATHER_CODES.get(w_code, "Partly cloudy")
-
-                forecast_days.append({
-                    "lead_day": lead_day,
-                    "date": date_str,
-                    "weather_code": w_code,
-                    "weather_desc": w_desc,
-                    "temp_max": round(t_max, 1),
-                    "temp_min": round(t_min, 1),
-                    "temp_avg": round(temp_avg, 1),
-                    "precipitation_mm": round(rain_sum, 1),
-                    "humidity_pct": round(hum_avg, 1),
-                    "wind_speed_ms": round(wind_max, 1),
-                    "pressure_hpa": round(pres_avg, 1),
-                    "pressure_drop_hpa": round(pres_drop, 1),
-                    "bust_prob": round(prob, 4),
-                    "risk_level": risk_level,
-                    "primary_driver": driver,
-                    "similarity_score": round(sim_score, 1),
-                    "past_event": event_name,
-                })
-
             result = {
                 "source": "openmeteo",
                 "lat": lat,
                 "lon": lon,
-                "forecast": forecast_days,
+                "forecast": _forecast_days_from_batch(day_meta, batch_preds),
             }
             OPENMETEO_CACHE[cache_key] = {"timestamp": now, "data": result}
             return result
@@ -1196,7 +1409,7 @@ async def fetch_openmeteo_10day_forecast(lat: float, lon: float) -> dict:
         driver = out[8]
         sim_score = out[9]
         event_name = out[10]
-        risk_level = "High" if prob >= 0.65 else ("Moderate" if prob >= 0.25 else "Low")
+        risk_level = "High" if prob > 0.5 else ("Moderate" if prob > 0.3 else "Low")
         w_desc = "Rain showers" if r > 15 else ("Slight rain" if r > 2 else "Clear sky")
         w_code = 80 if r > 15 else (61 if r > 2 else 0)
 
@@ -1209,11 +1422,13 @@ async def fetch_openmeteo_10day_forecast(lat: float, lon: float) -> dict:
             "temp_min": round(t - 3.0, 1),
             "temp_avg": round(t, 1),
             "precipitation_mm": round(r, 1),
+            "cape_jkg": 0.0,
             "humidity_pct": round(h, 1),
             "wind_speed_ms": round(w, 1),
             "pressure_hpa": round(p, 1),
             "pressure_drop_hpa": round(p_drop, 1),
             "bust_prob": round(prob, 4),
+            "confidence_pct": round((1.0 - float(prob)) * 100.0, 1),
             "risk_level": risk_level,
             "primary_driver": driver,
             "similarity_score": round(sim_score, 1),
@@ -1230,6 +1445,69 @@ async def fetch_openmeteo_10day_forecast(lat: float, lon: float) -> dict:
     return result
 
 
+def _regional_openmeteo_hubs() -> list[tuple[float, float]]:
+    """Coarse live-weather hubs covering the Indian land grid plus metro anchors."""
+    hubs: set[tuple[float, float]] = set()
+    for lat, lon in GRID_COORDS:
+        hubs.add((round(float(lat) / 3.0) * 3.0, round(float(lon) / 3.0) * 3.0))
+    for lat, lon in (
+        (28.61, 77.23), (19.07, 72.87), (22.57, 88.36), (13.08, 80.27),
+        (12.97, 77.59), (17.38, 78.47), (15.50, 73.83), (26.91, 75.79),
+        (23.03, 72.58), (21.15, 79.09), (30.73, 76.78), (8.52, 76.94),
+        (34.08, 74.79), (25.32, 82.97), (26.14, 91.74),
+    ):
+        hubs.add((round(lat, 2), round(lon, 2)))
+    return list(hubs)
+
+
+async def _fetch_openmeteo_hub_chunk(hubs: list[tuple[float, float]]) -> None:
+    if not hubs:
+        return
+    lat_csv = ",".join(f"{h[0]:.4f}" for h in hubs)
+    lon_csv = ",".join(f"{h[1]:.4f}" for h in hubs)
+    url = _openmeteo_forecast_url(lat_csv, lon_csv)
+    client = HTTPX_CLIENT if HTTPX_CLIENT is not None else httpx.AsyncClient(timeout=10.0)
+    close_client = HTTPX_CLIENT is None
+    try:
+        resp = await client.get(url)
+        if resp.status_code != 200:
+            print(f"Open-Meteo hub chunk HTTP {resp.status_code} for {len(hubs)} locations")
+            return
+        raw = resp.json()
+        payloads = raw if isinstance(raw, list) else [raw]
+        for hub, payload in zip(hubs, payloads):
+            if isinstance(payload, dict) and payload.get("hourly"):
+                _ingest_openmeteo_payload(payload, hub[0], hub[1])
+    except Exception as e:
+        print(f"Open-Meteo hub chunk failed: {e}")
+    finally:
+        if close_client:
+            await client.aclose()
+
+
+async def ensure_live_openmeteo_coverage() -> None:
+    """Populate regional live Open-Meteo hourly/daily caches used by /api/predict and ConvLSTM."""
+    global LIVE_OPENMETEO_HUB_TS
+    now = time.time()
+    if LIVE_OPENMETEO_DAILY_CACHE and (now - LIVE_OPENMETEO_HUB_TS) < OPENMETEO_CACHE_TTL:
+        return
+    async with LIVE_OPENMETEO_HUB_LOCK:
+        now = time.time()
+        if LIVE_OPENMETEO_DAILY_CACHE and (now - LIVE_OPENMETEO_HUB_TS) < OPENMETEO_CACHE_TTL:
+            return
+        hubs = _regional_openmeteo_hubs()
+        print(f"Fetching live Open-Meteo coverage for {len(hubs)} regional hubs...")
+        chunks = [hubs[i:i + 6] for i in range(0, len(hubs), 6)]
+        sem = asyncio.Semaphore(3)
+
+        async def _run(chunk):
+            async with sem:
+                await _fetch_openmeteo_hub_chunk(chunk)
+
+        await asyncio.gather(*(_run(c) for c in chunks))
+        LIVE_OPENMETEO_HUB_TS = time.time()
+        print(f"Live Open-Meteo hubs cached: hourly={len(LIVE_OPENMETEO_HOURLY_CACHE)} daily={len(LIVE_OPENMETEO_DAILY_CACHE)}")
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # FASTAPI LIFECYCLE & STARTUP
@@ -1239,7 +1517,7 @@ async def fetch_openmeteo_10day_forecast(lat: float, lon: float) -> dict:
 async def startup_event():
     global BACKGROUND_DATA, LIME_EXPLAINER, GRID_COORDS, IN_MEMORY_WEATHER_CACHE, HTTPX_CLIENT, SHAP_TREE_EXPLAINER
 
-    HTTPX_CLIENT = httpx.AsyncClient(timeout=3.5)
+    HTTPX_CLIENT = httpx.AsyncClient(timeout=10.0)
 
     root_dir = os.path.dirname(__file__)
     ensemble.load(root_dir)
@@ -1394,24 +1672,15 @@ async def predict(req: PredictRequest):
 
 @app.post("/api/explain_point")
 async def explain_point(req: ExplainRequest):
-    """Dynamic Dual-Engine XAI (SHAP + LIME) Click-to-Explain endpoint with Open-Meteo 10-day data."""
+    """Dynamic Dual-Engine XAI (SHAP + LIME) Click-to-Explain endpoint."""
     lat, lon, lead_day = req.lat, req.lon, req.lead_day
 
-    # 1. Fetch 10-day Open-Meteo future forecast data
-    om_data = await fetch_openmeteo_10day_forecast(lat, lon)
+    # 1. Generate deterministic forecast-card data and point prediction
+    om_data = _deterministic_10day_forecast(lat, lon)
     om_forecast = om_data.get("forecast", [])
     om_source = om_data.get("source", "fallback")
 
-    # Use real Open-Meteo forecast parameters for the requested lead_day if available
-    day_match = next((item for item in om_forecast if item["lead_day"] == lead_day), None)
-    if day_match and om_source == "openmeteo":
-        temp = day_match["temp_avg"]
-        rain = day_match["precipitation_mm"]
-        hum = day_match["humidity_pct"]
-        wind = day_match["wind_speed_ms"]
-        pres = day_match["pressure_hpa"]
-    else:
-        temp, rain, hum, wind, pres = generate_weather(lat, lon, lead_day)
+    temp, rain, hum, wind, pres = generate_weather(lat, lon, lead_day)
 
     (prob, temp_anom, rain2, conv, hum_out, wind_out, pres_out,
      pres_drop, driver, sim_score, event_name) = ensemble.predict(
@@ -1498,13 +1767,13 @@ async def explain_point(req: ExplainRequest):
 
 @app.get("/api/forecast_10day")
 async def get_forecast_10day(lat: float, lon: float):
-    """Return 10-day Open-Meteo future weather predictions and ML risk metrics for a location."""
-    data = await fetch_openmeteo_10day_forecast(lat, lon)
+    """Return deterministic 10-day weather predictions and ML risk metrics."""
+    data = _deterministic_10day_forecast(lat, lon)
     return {"status": "success", **data}
 
 
 @app.post("/api/forecast_10day")
 async def post_forecast_10day(req: Forecast10DayRequest):
-    """Return 10-day Open-Meteo future weather predictions and ML risk metrics for a location."""
-    data = await fetch_openmeteo_10day_forecast(req.lat, req.lon)
+    """Return deterministic 10-day weather predictions and ML risk metrics."""
+    data = _deterministic_10day_forecast(req.lat, req.lon)
     return {"status": "success", **data}
