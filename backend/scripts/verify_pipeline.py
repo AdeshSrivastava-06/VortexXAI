@@ -1,13 +1,14 @@
 import asyncio
 import os
 import sys
+from pathlib import Path
 
-# Ensure backend directory in sys.path
-backend_dir = os.path.dirname(__file__)
+# Ensure the backend project root is importable when this script is run directly.
+backend_dir = Path(__file__).resolve().parents[1]
 if backend_dir not in sys.path:
-    sys.path.insert(0, backend_dir)
+    sys.path.insert(0, str(backend_dir))
 
-from main import (
+from app.api.main import (
     app, startup_event, predict, explain_point,
     get_forecast_10day, fetch_openmeteo_10day_forecast,
     PredictRequest, ExplainRequest, ensemble

@@ -1,9 +1,10 @@
 import os
 import numpy as np
 import xarray as xr
+from pathlib import Path
 
-backend_dir = os.path.dirname(__file__)
-nc_path = os.path.join(backend_dir, "era5_india_latest.nc")
+backend_dir = Path(__file__).resolve().parents[1]
+nc_path = backend_dir / "data" / "era5_india_latest.nc"
 
 print("Generating NetCDF ERA5 dataset...")
 lats = np.arange(6.0, 38.25, 0.25)

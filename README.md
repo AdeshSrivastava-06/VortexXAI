@@ -38,15 +38,17 @@ In the current checked-in inference build, the backend consumes the local ERA5-s
 The MoES BUST-DETECT pipeline relies on two primary categories of meteorological data to evaluate forecast reliability:
 
 ### 1. Spatial Weather Tensors (Gridded Atmospheric Dynamics)
-* **Source / Proxy:** ERA5 Reanalysis / NCUM Operational Forecast Fields.
-* **Format:** NetCDF4 (`.nc`) spatial data tensors (`era5_india_latest.nc`).
-* **Variables Extracted:** 4-channel spatial grids including 850 hPa Wind Shear, Surface Temperature Anomaly, Relative Humidity, and Surface Pressure Drop.
-* **Spatio-Temporal Crop:** 5 sequential time steps processed via PyTorch ConvLSTM to capture atmospheric wave propagation and spatial continuity over the Indian landmass.
+
+- **Source / Proxy:** ERA5 Reanalysis / NCUM Operational Forecast Fields.
+- **Format:** NetCDF4 (`.nc`) spatial data tensors (`era5_india_latest.nc`).
+- **Variables Extracted:** 4-channel spatial grids including 850 hPa Wind Shear, Surface Temperature Anomaly, Relative Humidity, and Surface Pressure Drop.
+- **Spatio-Temporal Crop:** 5 sequential time steps processed via PyTorch ConvLSTM to capture atmospheric wave propagation and spatial continuity over the Indian landmass.
 
 ### 2. Tabular Feature Stream & Target Generation
-* **Predictor Features:** Point-wise atmospheric metrics (Temperature Anomaly, Rain Acceleration, Wind Shear, Relative Humidity, Pressure Drop).
-* **Target Metric ($\text{Bust}$):** Binary ground truth derived from historical forecast-minus-observation error fields:
-        $$\text{Bust} = 1 \quad \text{when} \quad (\vert{}\text{Forecast Rain} - \text{Observed Rain}\vert{} > 25\text{ mm}) \quad \text{OR} \quad (\vert{}\text{Forecast Temp} - \text{Observed Temp}\vert{} > 3.0^\circ\text{C})$$
+
+- **Predictor Features:** Point-wise atmospheric metrics (Temperature Anomaly, Rain Acceleration, Wind Shear, Relative Humidity, Pressure Drop).
+- **Target Metric ($\text{Bust}$):** Binary ground truth derived from historical forecast-minus-observation error fields:
+  $$\text{Bust} = 1 \quad \text{when} \quad (\vert{}\text{Forecast Rain} - \text{Observed Rain}\vert{} > 25\text{ mm}) \quad \text{OR} \quad (\vert{}\text{Forecast Temp} - \text{Observed Temp}\vert{} > 3.0^\circ\text{C})$$
 
 ## Key Features
 
@@ -79,22 +81,16 @@ FastAPI backend
 ```text
 VortexXAI/
 ├── backend/
-│   ├── main.py                         # FastAPI app and inference pipeline
+│   ├── app/
+│   │   ├── api/main.py                  # FastAPI app and inference pipeline
+│   │   ├── core/config.py               # Backend, model, and data paths
+│   │   ├── utils/                       # Shared backend utilities
+│   │   └── __init__.py
+│   ├── models/                          # Model checkpoints and meta-learner weights
+│   ├── data/                            # NetCDF and India GeoJSON data
+│   ├── scripts/                         # Inspection and verification utilities
 │   ├── requirements.txt                # Python dependencies
-│   ├── verify_pipeline.py              # End-to-end model/API verification
-│   ├── test_conv_model.py              # ConvLSTM loading and forward-pass check
-│   ├── test_netcdf.py                  # NetCDF generation/opening check
-│   ├── inspect_models.py               # Artifact inspection utility
-│   ├── inspect_convlstm.py             # ConvLSTM checkpoint inspection
-│   ├── inspect_conv_deep.py            # Deeper ConvLSTM inspection utility
-│   ├── convlstm_bust_model.pth         # PyTorch ConvLSTM checkpoint
-│   ├── lightgbm_bust_model.txt         # LightGBM booster
-│   ├── catboost_bust_model.cbm         # CatBoost classifier
-│   ├── meta_learner_coefs.npy          # Stacking coefficients
-│   ├── meta_learner_intercept.npy      # Stacking intercept
-│   ├── era5_india_latest.nc            # Regional spatial weather tensor
-│   ├── india_boundary.json             # India boundary data
-│   └── india_states.json               # State boundary data
+│   └── powershell.bat
 └── frontend/
     ├── package.json                    # Frontend dependencies and scripts
     ├── index.html
@@ -182,7 +178,7 @@ From the repository root:
 
 ```bash
 cd backend
-python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000
+python -m uvicorn app.api.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
 The API will be available at `http://localhost:8000`.
@@ -231,7 +227,7 @@ Returns the point prediction, SHAP values, LIME weights, feature values, and a d
 Run the full backend verification from the repository root:
 
 ```bash
-python backend/verify_pipeline.py
+python backend/scripts/verify_pipeline.py
 ```
 
 The verifier checks model artifact loading, NetCDF loading, ConvLSTM tensor shape, `/api/predict`, and `/api/explain_point`.
@@ -239,9 +235,9 @@ The verifier checks model artifact loading, NetCDF loading, ConvLSTM tensor shap
 Inspect model artifacts:
 
 ```bash
-python backend/inspect_models.py
-python backend/inspect_convlstm.py
-python backend/inspect_conv_deep.py
+python backend/scripts/inspect_models.py
+python backend/scripts/inspect_convlstm.py
+python backend/scripts/inspect_conv_deep.py
 ```
 
 Check the frontend production build:

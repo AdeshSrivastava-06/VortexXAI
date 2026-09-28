@@ -255,7 +255,7 @@ export default function MapComponent({
                   {obj.district_name}, {obj.state_name}
                 </span>
               </div>
-              <div className="text-slate-300 text-xs font-mono">
+              <div className="text-slate-300 text-sm font-mono">
                 {latVal.toFixed(2)}°N, {lonVal.toFixed(2)}°E
               </div>
               <div className="mt-2.5 flex items-end gap-2">

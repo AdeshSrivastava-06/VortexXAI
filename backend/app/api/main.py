@@ -7,7 +7,7 @@ import json
 import httpx
 import numpy as np
 import reverse_geocoder as rg
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -15,6 +15,8 @@ import torch
 import torch.nn as nn
 import lightgbm as lgb
 import catboost as cb
+from pathlib import Path
+from app.core.config import BACKEND_ROOT, DATA_DIR, MODELS_DIR
 
 try:
     import xarray as xr
@@ -80,6 +82,11 @@ class ExplainRequest(BaseModel):
     lat: float
     lon: float
     lead_day: int
+    location_label: str | None = None
+
+
+class SearchRequest(BaseModel):
+    query: str
 
 
 class Forecast10DayRequest(BaseModel):
@@ -207,8 +214,8 @@ def load_india_boundary():
     global INDIAN_POLYGONS, RAW_POLYGON_COORDS
 
     candidate_files = [
-        os.path.join(os.path.dirname(__file__), "india_states.json"),
-        os.path.join(os.path.dirname(__file__), "india_boundary.json")
+        DATA_DIR / "india_states.json",
+        DATA_DIR / "india_boundary.json",
     ]
 
     for filepath in candidate_files:
@@ -580,9 +587,9 @@ class EnsembleModel:
         self.meta_intercept = None
         self.netcdf_ds = None
 
-    def load(self, root_dir: str):
+    def load(self, models_dir: Path, data_dir: Path):
         # 1. Load PyTorch ConvLSTM
-        pth_path = os.path.join(root_dir, "convlstm_bust_model.pth")
+        pth_path = models_dir / "convlstm_bust_model.pth"
         if os.path.exists(pth_path):
             try:
                 self.convlstm_model = ConvLSTMModel(in_channels=4)
@@ -594,7 +601,7 @@ class EnsembleModel:
                 print(f"Failed to load PyTorch ConvLSTM model: {e}")
 
         # 2. Load LightGBM booster
-        lgb_path = os.path.join(root_dir, "lightgbm_bust_model.txt")
+        lgb_path = models_dir / "lightgbm_bust_model.txt"
         if os.path.exists(lgb_path):
             try:
                 with open(lgb_path, "rb") as f:
@@ -605,7 +612,7 @@ class EnsembleModel:
                 print(f"Failed to load LightGBM Booster: {e}")
 
         # 3. Load CatBoost model
-        cat_path = os.path.join(root_dir, "catboost_bust_model.cbm")
+        cat_path = models_dir / "catboost_bust_model.cbm"
         if os.path.exists(cat_path):
             try:
                 self.cat_model = cb.CatBoostClassifier()
@@ -615,8 +622,8 @@ class EnsembleModel:
                 print(f"Failed to load CatBoost model: {e}")
 
         # 4. Load Meta-Learner Logistic Regression weights
-        coefs_path = os.path.join(root_dir, "meta_learner_coefs.npy")
-        intercept_path = os.path.join(root_dir, "meta_learner_intercept.npy")
+        coefs_path = models_dir / "meta_learner_coefs.npy"
+        intercept_path = models_dir / "meta_learner_intercept.npy"
         if os.path.exists(coefs_path) and os.path.exists(intercept_path):
             try:
                 self.meta_coefs = np.load(coefs_path)
@@ -626,7 +633,7 @@ class EnsembleModel:
                 print(f"Failed to load Meta-Learner weights: {e}")
 
         # 5. Initialize/Load NetCDF regional spatial tensor dataset
-        nc_path = os.path.join(root_dir, "era5_india_latest.nc")
+        nc_path = data_dir / "era5_india_latest.nc"
         self._init_netcdf_dataset(nc_path)
 
         self.ready = True
@@ -1106,6 +1113,40 @@ IN_MEMORY_WEATHER_CACHE = {}
 GRID_COORDS = []
 
 
+def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Return the great-circle distance between two WGS84 coordinates."""
+    earth_radius_km = 6371.0088
+    lat1_rad, lat2_rad = math.radians(lat1), math.radians(lat2)
+    dlat = lat2_rad - lat1_rad
+    dlon = math.radians(lon2 - lon1)
+    a = (
+        math.sin(dlat / 2) ** 2
+        + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon / 2) ** 2
+    )
+    return 2 * earth_radius_km * math.asin(math.sqrt(a))
+
+
+def format_geocoded_location(result: dict) -> str:
+    """Prefer the most specific locality fields returned by Nominatim."""
+    address = result.get("address", {})
+    labels = []
+    for key in (
+        "neighbourhood",
+        "suburb",
+        "village",
+        "town",
+        "city_district",
+        "city",
+        "municipality",
+        "state_district",
+        "state",
+    ):
+        value = address.get(key)
+        if value and value not in labels:
+            labels.append(value)
+    return ", ".join(labels) or result.get("display_name", "India")
+
+
 def generate_weather(lat: float, lon: float, lead_day: int):
     """Deterministic, spatially coherent weather generator across Indian subcontinent."""
     seed = int(lat * 1000 + lon * 100 + lead_day)
@@ -1519,8 +1560,7 @@ async def startup_event():
 
     HTTPX_CLIENT = httpx.AsyncClient(timeout=10.0)
 
-    root_dir = os.path.dirname(__file__)
-    ensemble.load(root_dir)
+    ensemble.load(MODELS_DIR, DATA_DIR)
 
     # 1. Pre-cache SHAP TreeExplainer from loaded LightGBM Booster
     if shap is not None and ensemble.lgb_booster is not None:
@@ -1625,6 +1665,88 @@ async def shutdown_event():
 # REST API ENDPOINTS
 # ═══════════════════════════════════════════════════════════════════════════════
 
+@app.post("/api/search_location")
+async def search_location(req: SearchRequest):
+    """Geocode an India query and snap it to the closest generated land grid point."""
+    raw_query = req.query
+    if not raw_query.strip():
+        raise HTTPException(status_code=400, detail="Search query cannot be empty")
+    if not GRID_COORDS:
+        raise HTTPException(status_code=503, detail="Spatial grid is not ready")
+
+    params = {
+        "q": raw_query,
+        "format": "jsonv2",
+        "limit": 5,
+        "addressdetails": 1,
+        "countrycodes": "in",
+        "bounded": 1,
+        "viewbox": "68.0,37.5,97.5,6.5",
+        "accept-language": "en",
+    }
+    client = HTTPX_CLIENT if HTTPX_CLIENT is not None else httpx.AsyncClient(timeout=10.0)
+    close_client = HTTPX_CLIENT is None
+    try:
+        response = await client.get(
+            "https://nominatim.openstreetmap.org/search",
+            params=params,
+            headers={"User-Agent": "VortexXAI/1.0 (location search)"},
+        )
+        response.raise_for_status()
+        results = response.json()
+    except Exception as error:
+        raise HTTPException(status_code=502, detail=f"Geocoding service failed: {error}") from error
+    finally:
+        if close_client:
+            await client.aclose()
+
+    if not isinstance(results, list) or not results:
+        raise HTTPException(status_code=404, detail="No Indian location matched the query")
+
+    result = results[0]
+    try:
+        geocoded_lat = float(result["lat"])
+        geocoded_lon = float(result["lon"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise HTTPException(status_code=502, detail="Geocoder returned invalid coordinates") from error
+
+    nearest_lat, nearest_lon = min(
+        GRID_COORDS,
+        key=lambda coord: haversine_km(
+            geocoded_lat, geocoded_lon, coord[0], coord[1]
+        ),
+    )
+    snap_distance_km = haversine_km(
+        geocoded_lat, geocoded_lon, nearest_lat, nearest_lon
+    )
+    snapped_metadata = IN_MEMORY_WEATHER_CACHE.get(
+        (nearest_lat, nearest_lon),
+        {"state": "India", "district": "Local Zone"},
+    )
+    location_name = format_geocoded_location(result)
+
+    print(
+        f"Location snap: {raw_query!r} -> {location_name!r} "
+        f"({geocoded_lat:.6f}, {geocoded_lon:.6f}) -> "
+        f"({nearest_lat:.3f}, {nearest_lon:.3f}) "
+        f"distance={snap_distance_km:.2f} km"
+    )
+
+    return {
+        "query": raw_query,
+        "location_name": location_name,
+        "display_name": result.get("display_name", location_name),
+        "geocoded_lat": geocoded_lat,
+        "geocoded_lon": geocoded_lon,
+        "grid_id": f"{nearest_lat:.2f}_{nearest_lon:.2f}",
+        "snapped_lat": nearest_lat,
+        "snapped_lon": nearest_lon,
+        "snap_distance_km": round(snap_distance_km, 3),
+        "state_name": snapped_metadata.get("state", "India"),
+        "district_name": snapped_metadata.get("district", "Local Zone"),
+    }
+
+
 @app.post("/api/predict")
 async def predict(req: PredictRequest):
     """Return filtered Indian failure risk points for the given lead day."""
@@ -1702,6 +1824,7 @@ async def explain_point(req: ExplainRequest):
 
     district = geo["district"]
     state = geo["state"]
+    location_name = req.location_label or f"{district}, {state}"
 
     # 3. Form 5-feature vector: [Temp_Anom, Rain_Accel, Shear, Humidity, Pressure Drop]
     fvec = np.array([temp_anom, rain2, wind_out, hum_out, pres_drop], dtype=float)
@@ -1740,6 +1863,7 @@ async def explain_point(req: ExplainRequest):
     return {
         "lat": lat,
         "lon": lon,
+        "location_name": location_name,
         "state_name": state,
         "district_name": district,
         "bust_prob": round(prob, 4),

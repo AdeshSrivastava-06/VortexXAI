@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import os
+from pathlib import Path
 
 class ConvLSTMCell(nn.Module):
     def __init__(self, in_channels, hidden_channels, kernel_size=3):
@@ -70,7 +71,7 @@ class ConvLSTMModel(nn.Module):
         prob = torch.sigmoid(out.mean(dim=(-2, -1))).squeeze(-1) # (B, 1) or (B,)
         return prob
 
-pth_path = os.path.join(os.path.dirname(__file__), "convlstm_bust_model.pth")
+pth_path = Path(__file__).resolve().parents[1] / "models" / "convlstm_bust_model.pth"
 state_dict = torch.load(pth_path, map_location='cpu', weights_only=False)
 
 model = ConvLSTMModel(in_channels=4)

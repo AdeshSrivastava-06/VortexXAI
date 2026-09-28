@@ -173,6 +173,7 @@ export default function XAIDashboard({
   const nwpConfidencePct = Math.max(0, Math.min(100, 100 - prob * 100));
   const district = activeGrid.district_name || "Unknown";
   const state = activeGrid.state_name || "Unknown";
+  const locationLabel = activeGrid.location_name || activeGrid.location_label;
   const openMeteo10Day = activeGrid.openmeteo_10day || null;
   const weatherSource = activeGrid.weather_source || "deterministic";
 
@@ -274,9 +275,9 @@ export default function XAIDashboard({
           Explainable AI Panel
         </h2>
         <p className="text-base text-slate-200 font-medium mt-2">
-          📍 {district}, {state}
+          📍 {locationLabel || `${district}, ${state}`}
         </p>
-        <p className="text-sm text-slate-400 mt-1">
+        <p className="text-base text-slate-400 mt-1">
           {activeGrid.lat?.toFixed(2)}°N, {activeGrid.lon?.toFixed(2)}°E
           &nbsp;·&nbsp; Lead Day +{leadDay}
         </p>

@@ -51,19 +51,6 @@ const CITY_LOCATIONS = [
   ["Vadodara", 22.3072, 73.1812],
 ] as const;
 
-const distanceSquared = (
-  lat1: number,
-  lon1: number,
-  lat2: number,
-  lon2: number,
-) => {
-  const latScale = 111.32;
-  const lonScale = 111.32 * Math.cos((lat1 * Math.PI) / 180);
-  const dLat = (lat2 - lat1) * latScale;
-  const dLon = (lon2 - lon1) * lonScale;
-  return dLat * dLat + dLon * dLon;
-};
-
 function App() {
   const [leadDay, setLeadDay] = useState(1);
   const [gridData, setGridData] = useState<any[]>([]);
@@ -73,6 +60,9 @@ function App() {
   const [explainData, setExplainData] = useState<any>(null);
   const [isDrawerCollapsed, setIsDrawerCollapsed] = useState(false);
   const [mapSearch, setMapSearch] = useState("");
+  const [selectedLocationLabel, setSelectedLocationLabel] = useState<
+    string | null
+  >(null);
   const [focusPoint, setFocusPoint] = useState<{
     lat: number;
     lon: number;
@@ -138,6 +128,7 @@ function App() {
             lat: selectedGrid.lat,
             lon: selectedGrid.lon,
             lead_day: leadDay,
+            location_label: selectedLocationLabel,
           }),
           signal: controller.signal,
         });
@@ -163,79 +154,42 @@ function App() {
     return () => {
       controller.abort();
     };
-  }, [selectedGrid?.id, leadDay]);
+  }, [selectedGrid?.id, leadDay, selectedLocationLabel]);
 
   const handleSelectGrid = useCallback((grid: any) => {
     setSelectedGrid(grid);
+    setSelectedLocationLabel(null);
   }, []);
 
   const handleMapSearch = useCallback(async () => {
-    const query = mapSearch.trim();
-    if (!query || gridData.length === 0) return;
+    const rawQuery = mapSearch;
+    if (!rawQuery.trim() || gridData.length === 0) return;
 
-    const normalizedQuery = query.toLowerCase().replace(/[^a-z0-9]+/g, "");
-    const gridMatch = gridData.find((grid: any) => {
-      const gridLabel = `${grid.district_name || ""} ${grid.state_name || ""}`
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, "");
-      return (
-        gridLabel.includes(normalizedQuery) ||
-        normalizedQuery.includes(gridLabel)
+    try {
+      const response = await fetch(
+        "http://localhost:8000/api/search_location",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ query: rawQuery }),
+        },
       );
-    });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
-    let lat: number;
-    let lon: number;
-    let displayName = query;
-    if (gridMatch) {
-      setSelectedGrid(gridMatch);
-      setFocusPoint({ lat: gridMatch.lat, lon: gridMatch.lon });
-      setMapSearch(`${gridMatch.district_name}, ${gridMatch.state_name}`);
-      return;
-    }
-
-    const city = CITY_LOCATIONS.find(([name]) => {
-      const normalizedName = name.toLowerCase().replace(/[^a-z0-9]+/g, "");
-      return (
-        normalizedName === normalizedQuery ||
-        normalizedName.includes(normalizedQuery) ||
-        normalizedQuery.includes(normalizedName)
+      const location = await response.json();
+      const nearestGrid = gridData.find(
+        (grid: any) => grid.id === location.grid_id,
       );
-    });
+      if (!nearestGrid) return;
 
-    if (city) {
-      [, lat, lon] = city;
-      displayName = city[0];
-    } else {
-      try {
-        const response = await fetch(
-          `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&countrycodes=in&q=${encodeURIComponent(query)}`,
-        );
-        const results = await response.json();
-        if (!results?.[0]) return;
-        lat = Number(results[0].lat);
-        lon = Number(results[0].lon);
-        if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
-        displayName =
-          results[0].display_name?.split(",").slice(0, 2).join(",") || query;
-      } catch (error) {
-        console.error("Location search failed", error);
-        return;
-      }
-    }
-
-    const nearestGrid = gridData.reduce((nearest, grid) => {
-      if (!nearest) return grid;
-      return distanceSquared(lat, lon, grid.lat, grid.lon) <
-        distanceSquared(lat, lon, nearest.lat, nearest.lon)
-        ? grid
-        : nearest;
-    }, null as any);
-
-    if (nearestGrid) {
       setSelectedGrid(nearestGrid);
-      setFocusPoint({ lat: nearestGrid.lat, lon: nearestGrid.lon });
-      setMapSearch(displayName);
+      setSelectedLocationLabel(location.location_name || rawQuery);
+      setFocusPoint({
+        lat: Number(location.snapped_lat),
+        lon: Number(location.snapped_lon),
+      });
+    } catch (error) {
+      console.error("Location search failed", error);
     }
   }, [gridData, mapSearch]);
 

@@ -1,8 +1,9 @@
 import torch
 import torch.nn as nn
 import os
+from pathlib import Path
 
-pth_path = os.path.join(os.path.dirname(__file__), "convlstm_bust_model.pth")
+pth_path = Path(__file__).resolve().parents[1] / "models" / "convlstm_bust_model.pth"
 state_dict = torch.load(pth_path, map_location='cpu', weights_only=False)
 
 for k, v in state_dict.items():
