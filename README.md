@@ -84,13 +84,15 @@ VortexXAI/
 │   ├── app/
 │   │   ├── api/main.py                  # FastAPI app and inference pipeline
 │   │   ├── core/config.py               # Backend, model, and data paths
+│   │   ├── main.py                      # Compatibility ASGI entrypoint
 │   │   ├── utils/                       # Shared backend utilities
 │   │   └── __init__.py
 │   ├── models/                          # Model checkpoints and meta-learner weights
 │   ├── data/                            # NetCDF and India GeoJSON data
 │   ├── scripts/                         # Inspection and verification utilities
+│   ├── Dockerfile                        # Container image for the FastAPI service
 │   ├── requirements.txt                # Python dependencies
-│   └── powershell.bat
+│   └── ...
 └── frontend/
     ├── package.json                    # Frontend dependencies and scripts
     ├── index.html
@@ -183,6 +185,15 @@ python -m uvicorn app.api.main:app --reload --host 0.0.0.0 --port 8000
 
 The API will be available at `http://localhost:8000`.
 
+### Run with Docker
+
+From the repository root:
+
+```bash
+docker build -t vortexxai-backend ./backend
+docker run --rm -p 8000:8000 vortexxai-backend
+```
+
 ### Start the dashboard
 
 In a second terminal:
@@ -221,6 +232,18 @@ Request:
 ```
 
 Returns the point prediction, SHAP values, LIME weights, feature values, and a dynamic operational insight.
+
+#### `POST /api/search_location`
+
+Request:
+
+```json
+{
+  "query": "Ulwe Navi Mumbai"
+}
+```
+
+Geocodes an India-only location query, returns the specific locality label, and snaps it to the closest generated grid centroid with the snap distance in kilometers.
 
 ## Verification and Development Utilities
 
