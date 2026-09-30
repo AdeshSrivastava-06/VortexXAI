@@ -128,7 +128,7 @@ VortexXAI/
 - NumPy `.npy`
 - NetCDF `.nc`
 
-## Installation
+## Installations
 
 ### Prerequisites
 
